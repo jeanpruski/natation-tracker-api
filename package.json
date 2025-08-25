@@ -1,0 +1,19 @@
+{
+  "name": "natrack-back",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^4.19.0",
+    "mysql2": "^3.14.3",
+    "uuid": "^11.1.0"
+  }
+}
