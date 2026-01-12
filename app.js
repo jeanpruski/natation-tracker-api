@@ -1,5 +1,5 @@
-// app.js — API Natation (Express + MySQL)
-// --------------------------------------
+// app.js — API Natation (Express + MySQL) + type (swim/run)
+// ---------------------------------------------------------
 require("dotenv").config();
 
 const express = require("express");
@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3001;
 
 /* =========================
    CORS (prod + dev)
-   - Définis CORS_ORIGIN="https://natrack.prjski.com,http://localhost:3000"
+   - Exemple: CORS_ORIGIN="https://natrack.prjski.com,http://localhost:3000"
    ========================= */
 const WHITELIST = (process.env.CORS_ORIGIN || "")
   .split(",")
@@ -21,10 +21,9 @@ const WHITELIST = (process.env.CORS_ORIGIN || "")
 
 const corsOptions = {
   origin(origin, cb) {
-    // Autorise aussi les requêtes sans origin (curl, server-to-server)
     if (!origin) return cb(null, true);
     if (WHITELIST.length === 0 || WHITELIST.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
+    return cb(null, false);
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -32,7 +31,6 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-// Important pour que le préflight OPTIONS passe avec Authorization
 app.options("*", cors(corsOptions));
 
 app.use(express.json());
@@ -67,9 +65,50 @@ function requireEditAuth(req, res, next) {
 }
 
 /* =========================
+   Bloquer la navigation directe (GET document) => 204
+   ========================= */
+function blockBrowserNav(req, res, next) {
+  try {
+    if (req.method === "GET" && req.path !== "/health") {
+      const dest = (req.get("sec-fetch-dest") || "").toLowerCase();
+      const mode = (req.get("sec-fetch-mode") || "").toLowerCase();
+      const accept = (req.get("accept") || "").toLowerCase();
+
+      const isDocumentNav =
+        mode === "navigate" ||
+        dest === "document" ||
+        (accept.includes("text/html") && !accept.includes("application/json"));
+
+      if (isDocumentNav) {
+        return res.status(204).end();
+      }
+    }
+  } catch (e) {
+    console.error("blockBrowserNav error:", e);
+  }
+  return next();
+}
+
+/* =========================
+   Helpers type validation
+   ========================= */
+const ALLOWED_TYPES = new Set(["swim", "run"]);
+
+function normalizeType(input) {
+  if (!input) return "swim"; // défaut
+  const t = String(input).toLowerCase().trim();
+  return t;
+}
+
+function isValidType(t) {
+  return ALLOWED_TYPES.has(t);
+}
+
+/* =========================
    Router API
    ========================= */
 const api = express.Router();
+api.use(blockBrowserNav);
 
 // Healthcheck DB + app
 api.get("/health", async (_req, res) => {
@@ -86,14 +125,30 @@ api.get("/auth/check", requireEditAuth, (_req, res) => {
   res.json({ ok: true });
 });
 
-// Liste des séances
-api.get("/sessions", async (_req, res) => {
+// Liste des séances (option: ?type=swim|run)
+api.get("/sessions", async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      "SELECT id, DATE_FORMAT(date, '%Y-%m-%d') AS date, distance FROM sessions ORDER BY date ASC"
-    );
+    const type = req.query?.type ? normalizeType(req.query.type) : null;
+
+    if (type && !isValidType(type)) {
+      return res.status(400).json({ error: "type invalide (swim|run)" });
+    }
+
+    let sql =
+      "SELECT id, DATE_FORMAT(date, '%Y-%m-%d') AS date, distance, type FROM sessions";
+    const params = [];
+
+    if (type) {
+      sql += " WHERE type = ?";
+      params.push(type);
+    }
+
+    sql += " ORDER BY date ASC";
+
+    const [rows] = await pool.query(sql, params);
     res.json(rows);
   } catch (e) {
+    console.error("GET /sessions error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -101,17 +156,34 @@ api.get("/sessions", async (_req, res) => {
 // Création (protégé)
 api.post("/sessions", requireEditAuth, async (req, res) => {
   try {
-    const { distance, date, id } = req.body || {};
-    if (!distance || !date) {
-      return res.status(400).json({ error: "distance et date requis" });
+    const { distance, date, id, type } = req.body || {};
+
+    const t = normalizeType(type);
+
+    if (!date) return res.status(400).json({ error: "date requise" });
+    if (typeof distance === "undefined" || distance === null || distance === "") {
+      return res.status(400).json({ error: "distance requise" });
     }
+
+    const distNum = Number(distance);
+    if (!Number.isFinite(distNum) || distNum <= 0) {
+      return res.status(400).json({ error: "distance invalide" });
+    }
+
+    if (!isValidType(t)) {
+      return res.status(400).json({ error: "type invalide (swim|run)" });
+    }
+
     const newId = id || uuidv4();
+
     await pool.query(
-      "INSERT INTO sessions (id, date, distance) VALUES (?, ?, ?)",
-      [newId, date, Number(distance)]
+      "INSERT INTO sessions (id, date, distance, type) VALUES (?, ?, ?, ?)",
+      [newId, date, distNum, t]
     );
-    res.status(201).json({ id: newId, date, distance: Number(distance) });
+
+    res.status(201).json({ id: newId, date, distance: distNum, type: t });
   } catch (e) {
+    console.error("POST /sessions error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -120,25 +192,51 @@ api.post("/sessions", requireEditAuth, async (req, res) => {
 api.put("/sessions/:id", requireEditAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { distance, date } = req.body || {};
-    if (typeof distance === "undefined" && !date) {
+    const { distance, date, type } = req.body || {};
+
+    if (typeof distance === "undefined" && !date && typeof type === "undefined") {
       return res.status(400).json({ error: "aucune donnée à mettre à jour" });
     }
 
     const fields = [];
     const params = [];
-    if (date) { fields.push("date = ?"); params.push(date); }
-    if (typeof distance !== "undefined") { fields.push("distance = ?"); params.push(Number(distance)); }
+
+    if (date) {
+      fields.push("date = ?");
+      params.push(date);
+    }
+
+    if (typeof distance !== "undefined") {
+      const distNum = Number(distance);
+      if (!Number.isFinite(distNum) || distNum <= 0) {
+        return res.status(400).json({ error: "distance invalide" });
+      }
+      fields.push("distance = ?");
+      params.push(distNum);
+    }
+
+    if (typeof type !== "undefined") {
+      const t = normalizeType(type);
+      if (!isValidType(t)) {
+        return res.status(400).json({ error: "type invalide (swim|run)" });
+      }
+      fields.push("type = ?");
+      params.push(t);
+    }
+
     params.push(id);
 
     const [result] = await pool.query(
       `UPDATE sessions SET ${fields.join(", ")} WHERE id = ?`,
       params
     );
+
     if (result.affectedRows === 0) return res.status(404).json({ error: "not found" });
 
-    res.json({ id, date, distance });
+    // renvoie ce qui a été envoyé (simple)
+    res.json({ id, date, distance, type });
   } catch (e) {
+    console.error("PUT /sessions/:id error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -151,6 +249,7 @@ api.delete("/sessions/:id", requireEditAuth, async (req, res) => {
     if (result.affectedRows === 0) return res.status(404).json({ error: "not found" });
     res.status(204).end();
   } catch (e) {
+    console.error("DELETE /sessions/:id error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -163,6 +262,17 @@ app.use("/api", api);
 
 // Ping simple
 app.get("/", (_req, res) => res.send("API up"));
+
+/* =========================
+   Error handler global (JSON)
+   ========================= */
+app.use((err, req, res, _next) => {
+  try {
+    console.error("Unhandled error:", err);
+  } catch {}
+  if (res.headersSent) return;
+  res.status(500).json({ error: "internal_error" });
+});
 
 /* =========================
    Start
